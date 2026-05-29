@@ -1,0 +1,12 @@
+{
+  "name": "terrario-server",
+  "version": "1.0.0",
+  "description": "AI for virtual pets",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  }
+}
