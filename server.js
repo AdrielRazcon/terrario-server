@@ -3,41 +3,29 @@ let serviceAccount;
 if (process.env.SERVICE_ACCOUNT_JSON) {
   serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 } else {
-  serviceAccount = require('./serviceAccountKey.json');
+  try {
+    serviceAccount = require('./serviceAccountKey.json');
+  } catch (e) {
+    console.error('❌ No se encontró serviceAccountKey.json. Usa variable SERVICE_ACCOUNT_JSON en producción.');
+    process.exit(1);
+  }
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
-
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 const TICK_INTERVAL = 3000;
 
-const DECAY_HAMBRE = 0.5;
-const DECAY_ABURRIMIENTO = 0.3;
-const DECAY_SALUD_EXTREMA = 1;
-const HAMBRE_CRITICA = 70;
-const ABURRIMIENTO_CRITICO = 60;
-const SALUD_BAJA = 30;
+const DECAY = { hambre: 0.5, aburrimiento: 0.3, saludExtrema: 1 };
+const UMBRAL = { hambreCritica: 70, aburrimientoCritico: 60, saludBaja: 30 };
+const SYMBOLS = { comida: 'C', agua: 'A', cama: 'B', juguete: 'J' };
 
-// Mapeo de símbolos que usa el mapa (S, M, C, A, B, J)
-const SYMBOLS = {
-  comida: 'C',
-  agua: 'A',
-  cama: 'B',
-  juguete: 'J'
-};
-
-function encontrarMasCercano(mapa, x, y, charObjetivo) {
+function encontrarMasCercano(mapa, x, y, char) {
   let mejor = null, mejorDist = Infinity;
   for (let fy = 0; fy < mapa.length; fy++) {
     for (let fx = 0; fx < mapa[fy].length; fx++) {
-      if (mapa[fy][fx] === charObjetivo) {
+      if (mapa[fy][fx] === char) {
         const dist = Math.abs(fx - x) + Math.abs(fy - y);
-        if (dist < mejorDist) {
-          mejorDist = dist;
-          mejor = { x: fx, y: fy };
-        }
+        if (dist < mejorDist) { mejorDist = dist; mejor = { x: fx, y: fy }; }
       }
     }
   }
@@ -45,12 +33,11 @@ function encontrarMasCercano(mapa, x, y, charObjetivo) {
 }
 
 function esTransitable(x, y, mapa) {
-  return y >= 0 && y < mapa.length && x >= 0 && x < mapa[0].length && mapa[y][x] !== 'M'; // 'M' es muro
+  return y >= 0 && y < mapa.length && x >= 0 && x < mapa[0].length && mapa[y][x] !== 'M';
 }
 
 function moverHacia(x, y, tx, ty, mapa) {
-  const dx = Math.sign(tx - x);
-  const dy = Math.sign(ty - y);
+  const dx = Math.sign(tx - x), dy = Math.sign(ty - y);
   if (Math.abs(tx - x) > Math.abs(ty - y)) {
     if (esTransitable(x + dx, y, mapa)) return { x: x + dx, y };
     if (esTransitable(x, y + dy, mapa)) return { x, y: y + dy };
@@ -61,96 +48,65 @@ function moverHacia(x, y, tx, ty, mapa) {
   return { x, y };
 }
 
-function calcularEmocion(est) {
+function emocion(est) {
   const f = est.felicidad ?? (100 - (est.hambre + est.aburrimiento) / 2);
-  if (f > 70) return 'feliz';
-  if (f > 40) return 'neutro';
-  if (f > 20) return 'triste';
-  return 'enojado';
+  if (f > 70) return 'feliz'; else if (f > 40) return 'neutro'; else if (f > 20) return 'triste'; else return 'enojado';
 }
 
 async function procesarMascota(doc) {
   const data = doc.data();
   if (!data.uid) return;
-
-  let { hambre, aburrimiento, salud } = data.estadisticas;
-  hambre = Math.min(100, hambre + DECAY_HAMBRE);
-  aburrimiento = Math.min(100, aburrimiento + DECAY_ABURRIMIENTO);
-  if (hambre >= 90 || aburrimiento >= 90) {
-    salud = Math.max(0, salud - DECAY_SALUD_EXTREMA);
-  }
+  let est = data.estadisticas;
+  let hambre = Math.min(100, est.hambre + DECAY.hambre);
+  let aburrimiento = Math.min(100, est.aburrimiento + DECAY.aburrimiento);
+  let salud = est.salud;
+  if (hambre >= 90 || aburrimiento >= 90) salud = Math.max(0, salud - DECAY.saludExtrema);
 
   let accion = data.accionActual || 'vagar';
   let tarea = data.tareaAsignada;
 
-  if (tarea && hambre < HAMBRE_CRITICA && salud > 20) {
-    accion = 'tarea_asignada';
-  } else if (hambre > HAMBRE_CRITICA) {
-    accion = 'buscar_comida';
-  } else if (aburrimiento > ABURRIMIENTO_CRITICO) {
-    accion = 'buscar_juguete';
-  } else if (salud < SALUD_BAJA) {
-    accion = 'buscar_cama';
-  } else {
-    accion = 'vagar';
-  }
+  if (tarea && hambre < UMBRAL.hambreCritica && salud > 20) accion = 'tarea_asignada';
+  else if (hambre > UMBRAL.hambreCritica) accion = 'buscar_comida';
+  else if (aburrimiento > UMBRAL.aburrimientoCritico) accion = 'buscar_juguete';
+  else if (salud < UMBRAL.saludBaja) accion = 'buscar_cama';
+  else accion = 'vagar';
 
   let { x, y } = data;
   const mapa = data.mapa;
 
-  if (accion === 'tarea_asignada' && tarea) {
-    const tipo = tarea.tipo; // 'comida', 'juguete', 'cama'
-    const charObjetivo = SYMBOLS[tipo];
-    if (charObjetivo) {
-      const coords = encontrarMasCercano(mapa, x, y, charObjetivo);
-      if (coords) {
-        const nuevo = moverHacia(x, y, coords.x, coords.y, mapa);
-        x = nuevo.x; y = nuevo.y;
-        if (x === coords.x && y === coords.y) {
-          // Interactuar
-          if (tipo === 'comida') hambre = Math.max(0, hambre - 30);
-          else if (tipo === 'juguete') aburrimiento = Math.max(0, aburrimiento - 25);
-          else if (tipo === 'cama') salud = Math.min(100, salud + 20);
-          data.tareaAsignada = null;
-        }
+  const ejecutarBusqueda = async (tipo, simbolo) => {
+    const coord = encontrarMasCercano(mapa, x, y, simbolo);
+    if (coord) {
+      const nuevo = moverHacia(x, y, coord.x, coord.y, mapa);
+      x = nuevo.x; y = nuevo.y;
+      if (x === coord.x && y === coord.y) {
+        if (tipo === 'comida') hambre = Math.max(0, hambre - 30);
+        else if (tipo === 'juguete') aburrimiento = Math.max(0, aburrimiento - 25);
+        else if (tipo === 'cama') salud = Math.min(100, salud + 20);
+        if (tarea) data.tareaAsignada = null;
       }
     }
+    return { x, y };
+  };
+
+  if (accion === 'tarea_asignada' && tarea) {
+    const simbolo = SYMBOLS[tarea.tipo];
+    if (simbolo) await ejecutarBusqueda(tarea.tipo, simbolo);
   } else if (accion.startsWith('buscar_')) {
     const tipo = accion.replace('buscar_', '');
-    const charObjetivo = SYMBOLS[tipo];
-    if (charObjetivo) {
-      const coords = encontrarMasCercano(mapa, x, y, charObjetivo);
-      if (coords) {
-        const nuevo = moverHacia(x, y, coords.x, coords.y, mapa);
-        x = nuevo.x; y = nuevo.y;
-        if (x === coords.x && y === coords.y) {
-          if (tipo === 'comida') hambre = Math.max(0, hambre - 30);
-          else if (tipo === 'juguete') aburrimiento = Math.max(0, aburrimiento - 25);
-          else if (tipo === 'cama') salud = Math.min(100, salud + 20);
-        }
-      }
-    }
+    const simbolo = SYMBOLS[tipo];
+    if (simbolo) await ejecutarBusqueda(tipo, simbolo);
   } else if (accion === 'vagar') {
-    const dirs = [[0,1],[0,-1],[1,0],[-1,0]];
-    for (let i = dirs.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [dirs[i], dirs[j]] = [dirs[j], dirs[i]];
-    }
+    const dirs = [[0,1],[0,-1],[1,0],[-1,0]].sort(() => Math.random() - 0.5);
     for (const [dx, dy] of dirs) {
-      const nx = x + dx, ny = y + dy;
-      if (esTransitable(nx, ny, mapa)) {
-        x = nx; y = ny;
-        break;
-      }
+      if (esTransitable(x + dx, y + dy, mapa)) { x += dx; y += dy; break; }
     }
   }
-
-  const emocion = calcularEmocion({ hambre, aburrimiento, salud });
 
   await doc.ref.update({
     x, y,
     estadisticas: { hambre, aburrimiento, salud },
-    emocion,
+    emocion: emocion({ hambre, aburrimiento, salud }),
     accionActual: accion,
     tareaAsignada: data.tareaAsignada || null,
     ultimaActualizacion: admin.firestore.FieldValue.serverTimestamp()
@@ -162,9 +118,9 @@ async function tick() {
   const promesas = [];
   snapshot.forEach(doc => promesas.push(procesarMascota(doc)));
   await Promise.all(promesas);
-  console.log(`Tick para ${promesas.length} mascotas`);
+  console.log(`✅ Tick para ${promesas.length} mascotas`);
 }
 
 tick();
 setInterval(tick, TICK_INTERVAL);
-console.log('Servidor de mascotas en marcha');  
+console.log('🧠 Servidor de mascotas corriendo cada', TICK_INTERVAL/1000, 's');
