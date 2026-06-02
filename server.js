@@ -1,4 +1,7 @@
 const admin = require('firebase-admin');
+const http = require('http');
+
+// Configurar Firebase
 let serviceAccount;
 if (process.env.SERVICE_ACCOUNT_JSON) {
   serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
@@ -13,12 +16,13 @@ if (process.env.SERVICE_ACCOUNT_JSON) {
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
-const TICK_INTERVAL = 3000;
 
+const TICK_INTERVAL = 3000;
 const DECAY = { hambre: 0.5, aburrimiento: 0.3, saludExtrema: 1 };
 const UMBRAL = { hambreCritica: 70, aburrimientoCritico: 60, saludBaja: 30 };
 const SYMBOLS = { comida: 'C', agua: 'A', cama: 'B', juguete: 'J' };
 
+// Funciones auxiliares
 function encontrarMasCercano(mapa, x, y, char) {
   let mejor = null, mejorDist = Infinity;
   for (let fy = 0; fy < mapa.length; fy++) {
@@ -114,13 +118,29 @@ async function procesarMascota(doc) {
 }
 
 async function tick() {
-  const snapshot = await db.collection('mascotas').get();
-  const promesas = [];
-  snapshot.forEach(doc => promesas.push(procesarMascota(doc)));
-  await Promise.all(promesas);
-  console.log(`✅ Tick para ${promesas.length} mascotas`);
+  try {
+    const snapshot = await db.collection('mascotas').get();
+    const promesas = [];
+    snapshot.forEach(doc => promesas.push(procesarMascota(doc)));
+    await Promise.all(promesas);
+    console.log(`✅ Tick para ${promesas.length} mascotas`);
+  } catch (err) {
+    console.error('Error en tick:', err);
+  }
 }
 
+// Iniciar bucle de IA
 tick();
 setInterval(tick, TICK_INTERVAL);
 console.log('🧠 Servidor de mascotas corriendo cada', TICK_INTERVAL/1000, 's');
+
+// ─── Crear servidor HTTP mínimo para Render ───
+const PORT = process.env.PORT || 3000;
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Mascota virtual viva 🐜');
+});
+
+server.listen(PORT, () => {
+  console.log(`🌐 Servidor HTTP escuchando en puerto ${PORT} (para health check)`);
+});
