@@ -6,76 +6,51 @@ let serviceAccount;
 if (process.env.SERVICE_ACCOUNT_JSON) {
   serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 } else {
-  try {
-    serviceAccount = require('./serviceAccountKey.json');
-  } catch (e) {
-    console.error('❌ Falta serviceAccountKey.json o variable SERVICE_ACCOUNT_JSON');
-    process.exit(1);
-  }
+  try { serviceAccount = require('./serviceAccountKey.json'); }
+  catch (e) { console.error('❌ Falta clave'); process.exit(1); }
 }
-
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-const TICK_INTERVAL = 3000;
+// Parámetros de simulación
+const TICK_INTERVAL = 2000;        // 2 segundos reales = 1 tick
+const TICKS_POR_HORA = 30;        // 30 ticks = 1 hora de juego → 720 ticks = 1 día
+let tickCount = 0;
+
+// Símbolos del mapa
+const SYMB = {
+  suelo: 'S', muro: 'M', comida: 'C', agua: 'A', cama: 'B', juguete: 'J',
+  arbusto: 'Y', almacen: 'L', pozo: 'W', muerto: 'D'
+};
 
 // Decaimientos por tick
 const DECAY = {
-  hambre: 0.5,
-  sed: 0.5,
-  aburrimiento: 0.3,
-  sueño: 0.4,
-  saludExtrema: 1       // cuando hambre y sed están al 100%
+  hambre: 0.08, sed: 0.08, aburrimiento: 0.05, sueño: 0.06
 };
-
 const UMBRAL = {
-  hambreCritica: 70,
-  sedCritica: 70,
-  aburrimientoCritico: 60,
-  sueñoCritico: 70,
+  hambreCritica: 70, sedCritica: 70, aburrimientoCritico: 60, sueñoCritico: 70,
   saludBaja: 30
 };
 
-// Símbolos del mapa
-const SYMBOLS = {
-  comida: 'C',
-  agua: 'A',
-  cama: 'B',
-  juguete: 'J',
-  suelo: 'S',
-  muro: 'M',
-  popo: 'P'
-};
-
-// ===================== Pathfinding A* =====================
+// Pathfinding A*
 function aStar(mapa, startX, startY, targetX, targetY) {
-  const rows = mapa.length;
-  const cols = mapa[0].length;
-  const open = [];
-  const closed = new Set();
-  const gScores = new Map();
-  const fScores = new Map();
-  const cameFrom = new Map();
-
+  const rows = mapa.length, cols = mapa[0].length;
+  const open = [], closed = new Set();
+  const gScores = new Map(), fScores = new Map(), cameFrom = new Map();
   const key = (x, y) => `${x},${y}`;
+  const heuristic = (x, y) => Math.abs(x - targetX) + Math.abs(y - targetY);
 
-  const heuristic = (x, y) => Math.abs(x - targetX) + Math.abs(y - targetY); // Manhattan
-
-  const startKey = key(startX, startY);
-  gScores.set(startKey, 0);
-  fScores.set(startKey, heuristic(startX, startY));
-  open.push({ x: startX, y: startY, f: fScores.get(startKey) });
+  open.push({ x: startX, y: startY, f: heuristic(startX, startY) });
+  gScores.set(key(startX, startY), 0);
+  fScores.set(key(startX, startY), heuristic(startX, startY));
 
   while (open.length > 0) {
-    // Ordenar por fScore más bajo (podríamos usar una cola de prioridad, pero así funciona)
     open.sort((a, b) => a.f - b.f);
     const current = open.shift();
-    const currentKey = key(current.x, current.y);
-
+    const ck = key(current.x, current.y);
     if (current.x === targetX && current.y === targetY) {
-      // Reconstruir camino
       const path = [];
-      let k = currentKey;
+      let k = ck;
       while (k) {
         const [x, y] = k.split(',').map(Number);
         path.unshift({ x, y });
@@ -83,46 +58,31 @@ function aStar(mapa, startX, startY, targetX, targetY) {
       }
       return path;
     }
-
-    closed.add(currentKey);
-
-    const neighbors = [
-      { x: current.x + 1, y: current.y },
-      { x: current.x - 1, y: current.y },
-      { x: current.x, y: current.y + 1 },
-      { x: current.x, y: current.y - 1 }
-    ];
-
-    for (const neighbor of neighbors) {
-      const nx = neighbor.x, ny = neighbor.y;
+    closed.add(ck);
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const nx = current.x + dx, ny = current.y + dy;
       if (ny < 0 || ny >= rows || nx < 0 || nx >= cols) continue;
-      const tile = mapa[ny][nx];
-      if (tile === SYMBOLS.muro) continue; // no atravesable
-
-      const neighborKey = key(nx, ny);
-      if (closed.has(neighborKey)) continue;
-
-      const tentativeG = (gScores.get(currentKey) || 0) + 1;
-      if (!gScores.has(neighborKey) || tentativeG < gScores.get(neighborKey)) {
-        cameFrom.set(neighborKey, currentKey);
-        gScores.set(neighborKey, tentativeG);
-        fScores.set(neighborKey, tentativeG + heuristic(nx, ny));
-        open.push({ x: nx, y: ny, f: fScores.get(neighborKey) });
+      if (mapa[ny][nx] === SYMB.muro) continue;
+      const nk = key(nx, ny);
+      if (closed.has(nk)) continue;
+      const tg = (gScores.get(ck) || 0) + 1;
+      if (!gScores.has(nk) || tg < gScores.get(nk)) {
+        cameFrom.set(nk, ck);
+        gScores.set(nk, tg);
+        fScores.set(nk, tg + heuristic(nx, ny));
+        open.push({ x: nx, y: ny, f: fScores.get(nk) });
       }
     }
   }
-  return null; // no hay camino
+  return null;
 }
 
-function moverConAStar(x, y, mapa, targetX, targetY) {
-  const path = aStar(mapa, x, y, targetX, targetY);
-  if (path && path.length > 1) {
-    return path[1]; // siguiente paso (índice 0 es la posición actual)
-  }
-  return { x, y }; // no se mueve
+function moverHaciaConAStar(x, y, mapa, tx, ty) {
+  const path = aStar(mapa, x, y, tx, ty);
+  if (path && path.length > 1) return path[1];
+  return { x, y };
 }
 
-// ===================== Funciones de IA =====================
 function encontrarMasCercano(mapa, x, y, char) {
   let mejor = null, mejorDist = Infinity;
   for (let fy = 0; fy < mapa.length; fy++) {
@@ -137,139 +97,295 @@ function encontrarMasCercano(mapa, x, y, char) {
 }
 
 function esTransitable(mapa, x, y) {
-  return y >= 0 && y < mapa.length && x >= 0 && x < mapa[0].length && mapa[y][x] !== SYMBOLS.muro;
+  return y >= 0 && y < mapa.length && x >= 0 && x < mapa[0].length && mapa[y][x] !== SYMB.muro;
 }
 
-function emocion(est) {
-  const f = est.felicidad ?? (100 - (est.hambre + est.sed + est.aburrimiento + est.sueño) / 4);
-  if (f > 70) return 'feliz'; else if (f > 40) return 'neutro'; else if (f > 20) return 'triste'; else return 'enojado';
+// Emoción (para mostrar en UI)
+function calcularEmocion(est) {
+  const bienestar = 100 - (est.hambre + est.sed + est.aburrimiento + est.sueño) / 4;
+  if (bienestar > 70) return 'feliz';
+  if (bienestar > 40) return 'neutro';
+  if (bienestar > 20) return 'triste';
+  return 'enojado';
 }
 
-async function procesarMascota(doc) {
-  const data = doc.data();
-  if (!data.uid) return;
+// ==================== Procesamiento de una criatura ====================
+async function procesarCriatura(docRef, criaturaId, colonia, mapa, recursos, hora) {
+  const criaturaDoc = await docRef.collection('criaturas').doc(criaturaId).get();
+  if (!criaturaDoc.exists) return;
+  const data = criaturaDoc.data();
+  if (data.estado !== 'viva') return;
 
-  // Inicializar estadísticas si faltan (por migración)
-  let est = data.estadisticas || { hambre: 50, sed: 50, aburrimiento: 30, sueño: 30, salud: 80 };
-  est.hambre = est.hambre ?? 50;
-  est.sed = est.sed ?? 50;
-  est.aburrimiento = est.aburrimiento ?? 30;
-  est.sueño = est.sueño ?? 30;
-  est.salud = est.salud ?? 80;
+  let est = data.estadisticas;
+  let x = data.x, y = data.y;
 
-  // Aplicar decaimientos
+  // Decaimientos
   est.hambre = Math.min(100, est.hambre + DECAY.hambre);
   est.sed = Math.min(100, est.sed + DECAY.sed);
   est.aburrimiento = Math.min(100, est.aburrimiento + DECAY.aburrimiento);
   est.sueño = Math.min(100, est.sueño + DECAY.sueño);
 
-  // Salud solo baja si hambre Y sed están al tope
-  if (est.hambre >= 100 && est.sed >= 100) {
-    est.salud = Math.max(0, est.salud - DECAY.saludExtrema);
+  // Enfermedad
+  if (!est.enfermedad && Math.random() < 0.001) est.enfermedad = true;
+  if (est.enfermedad) est.salud = Math.max(0, est.salud - 0.3);
+
+  // Muerte por salud
+  if (est.salud <= 0 || est.hambre >= 100 || est.sed >= 100 || data.edad >= data.edadMaxima) {
+    // Convertir en cadáver
+    const fila = mapa[y];
+    mapa[y] = fila.substring(0, x) + SYMB.muerto + fila.substring(x + 1);
+    await criaturaDoc.ref.update({ estado: 'muerta' });
+    return;
   }
 
   // Decidir acción
-  let accion = data.accionActual || 'vagar';
-  const tarea = data.tareaAsignada;
+  const esDeNoche = (hora >= 20 || hora < 6);
+  let accion = 'vagar';
+  let objetivoX, objetivoY, objetivoChar;
 
-  if (tarea && est.hambre < UMBRAL.hambreCritica && est.sed < UMBRAL.sedCritica && est.salud > 20) {
-    accion = 'tarea_asignada';
+  if (data.tareaAsignada) {
+    accion = 'tarea';
+    objetivoChar = SYMB[data.tareaAsignada.tipo] || null;
+    if (!objetivoChar) accion = 'vagar';
   } else if (est.hambre > UMBRAL.hambreCritica) {
-    accion = 'buscar_comida';
+    if (recursos.comida > 0) {
+      // Ir al almacén a comer
+      accion = 'ir_almacen_comer';
+      objetivoChar = SYMB.almacen;
+    } else {
+      accion = 'buscar_comida';
+      objetivoChar = SYMB.comida;
+    }
   } else if (est.sed > UMBRAL.sedCritica) {
-    accion = 'buscar_agua';
+    if (recursos.agua > 0) {
+      accion = 'ir_almacen_beber';
+      objetivoChar = SYMB.almacen;
+    } else {
+      accion = 'buscar_agua';
+      objetivoChar = SYMB.agua;
+    }
   } else if (est.aburrimiento > UMBRAL.aburrimientoCritico) {
     accion = 'buscar_juguete';
-  } else if (est.sueño > UMBRAL.sueñoCritico) {
+    objetivoChar = SYMB.juguete;
+  } else if (est.sueño > UMBRAL.sueñoCritico || (esDeNoche && est.sueño > 50)) {
     accion = 'buscar_cama';
+    objetivoChar = SYMB.cama;
   } else {
-    accion = 'vagar';
+    // Recolección si hay arbustos y no hay urgencias
+    const hayArbusto = mapa.some(fila => fila.includes(SYMB.arbusto));
+    if (hayArbusto && recursos.comida < 20) {
+      accion = 'recolectar';
+      objetivoChar = SYMB.arbusto;
+    } else {
+      accion = 'vagar';
+    }
   }
 
-  let { x, y } = data;
-  const mapa = data.mapa;
-
-  // Ejecutar acción con A*
-  const ejecutarBusqueda = async (tipo, simbolo) => {
-    const coord = encontrarMasCercano(mapa, x, y, simbolo);
-    if (coord) {
-      const paso = moverConAStar(x, y, mapa, coord.x, coord.y);
+  // Movimiento y ejecución de acción
+  if (objetivoChar) {
+    const coords = encontrarMasCercano(mapa, x, y, objetivoChar);
+    if (coords) {
+      const paso = moverHaciaConAStar(x, y, mapa, coords.x, coords.y);
       x = paso.x; y = paso.y;
-      if (x === coord.x && y === coord.y) {
-        // Interacción: satisfacer necesidad
-        if (tipo === 'comida') est.hambre = Math.max(0, est.hambre - 30);
-        else if (tipo === 'agua') est.sed = Math.max(0, est.sed - 30);
-        else if (tipo === 'juguete') est.aburrimiento = Math.max(0, est.aburrimiento - 25);
-        else if (tipo === 'cama') est.sueño = Math.max(0, est.sueño - 40);
-        if (tarea && tarea.tipo === tipo) data.tareaAsignada = null;
+      if (x === coords.x && y === coords.y) {
+        // Interacción
+        const tile = mapa[coords.y][coords.x];
+        if (accion === 'ir_almacen_comer') {
+          if (recursos.comida > 0) {
+            est.hambre = Math.max(0, est.hambre - 30);
+            recursos.comida--;
+          }
+        } else if (accion === 'ir_almacen_beber') {
+          if (recursos.agua > 0) {
+            est.sed = Math.max(0, est.sed - 30);
+            recursos.agua--;
+          }
+        } else if (accion === 'buscar_comida' && tile === SYMB.comida) {
+          est.hambre = Math.max(0, est.hambre - 25);
+        } else if (accion === 'buscar_agua' && tile === SYMB.agua) {
+          est.sed = Math.max(0, est.sed - 25);
+        } else if (accion === 'buscar_juguete' && tile === SYMB.juguete) {
+          est.aburrimiento = Math.max(0, est.aburrimiento - 20);
+        } else if (accion === 'buscar_cama' && tile === SYMB.cama) {
+          est.sueño = Math.max(0, est.sueño - 35);
+        } else if (accion === 'recolectar' && tile === SYMB.arbusto) {
+          // Recolectar: añadir comida al almacén y reducir arbusto
+          recursos.comida++;
+          // El arbusto desaparece tras 3 recolecciones (usamos un contador en el mapa? mejor probabilidad)
+          if (Math.random() < 0.3) {
+            const fila = mapa[coords.y];
+            mapa[coords.y] = fila.substring(0, coords.x) + SYMB.suelo + fila.substring(coords.x + 1);
+          }
+        }
+        data.tareaAsignada = null; // tarea completada
       }
     }
-  };
-
-  if (accion === 'tarea_asignada' && tarea) {
-    const simbolo = SYMBOLS[tarea.tipo];
-    if (simbolo) await ejecutarBusqueda(tarea.tipo, simbolo);
-  } else if (accion === 'buscar_comida') {
-    await ejecutarBusqueda('comida', SYMBOLS.comida);
-  } else if (accion === 'buscar_agua') {
-    await ejecutarBusqueda('agua', SYMBOLS.agua);
-  } else if (accion === 'buscar_juguete') {
-    await ejecutarBusqueda('juguete', SYMBOLS.juguete);
-  } else if (accion === 'buscar_cama') {
-    await ejecutarBusqueda('cama', SYMBOLS.cama);
   } else if (accion === 'vagar') {
     const dirs = [[0,1],[0,-1],[1,0],[-1,0]].sort(() => Math.random() - 0.5);
     for (const [dx, dy] of dirs) {
-      const nx = x + dx, ny = y + dy;
-      if (esTransitable(mapa, nx, ny)) {
-        x = nx; y = ny;
+      if (esTransitable(mapa, x + dx, y + dy)) {
+        x += dx; y += dy;
         break;
       }
     }
   }
 
-  // Defecación: probabilidad del 5% si está sobre suelo
-  if (Math.random() < 0.05 && mapa[y] && mapa[y][x] === SYMBOLS.suelo) {
-    // Convertir esa celda en popó
-    const fila = mapa[y];
-    mapa[y] = fila.substring(0, x) + SYMBOLS.popo + fila.substring(x + 1);
-    // Guardar el mapa actualizado
-    data.mapa = mapa;
-  }
+  // Aumentar edad cada día (lo haremos en el ciclo global)
+  // Pero la edad en días se actualiza una vez al día.
 
-  // Guardar cambios
-  await doc.ref.update({
-    x, y,
-    mapa: data.mapa,
+  await criaturaDoc.ref.update({
     estadisticas: est,
-    emocion: emocion(est),
-    accionActual: accion,
-    tareaAsignada: data.tareaAsignada || null,
-    ultimaActualizacion: admin.firestore.FieldValue.serverTimestamp()
+    x, y,
+    tareaAsignada: data.tareaAsignada,
+    emocion: calcularEmocion(est)
   });
+
+  // Devolver recursos actualizados
+  return { recursos };
 }
 
-async function tick() {
-  try {
-    const snapshot = await db.collection('mascotas').get();
-    const promesas = [];
-    snapshot.forEach(doc => promesas.push(procesarMascota(doc)));
-    await Promise.all(promesas);
-    console.log(`✅ Tick para ${promesas.length} mascotas`);
-  } catch (err) {
-    console.error('Error en tick:', err);
+// ==================== Reglas de población y peleas ====================
+async function aplicarReglasPoblacion(docRef, criaturasVivas) {
+  const machos = criaturasVivas.filter(c => c.sexo === 'macho' && c.edad >= 3); // adultos
+  const hembras = criaturasVivas.filter(c => c.sexo === 'hembra' && c.edad >= 3);
+  const limiteMachos = 1;
+  const limiteHembras = 5;
+
+  // Peleas entre machos
+  while (machos.length > limiteMachos) {
+    const perdedor = machos.pop(); // eliminar el último (podría ser aleatorio)
+    // Reducir salud drásticamente o matar
+    await docRef.collection('criaturas').doc(perdedor.id).update({ estado: 'muerta' });
+    // Convertir tile
+    const colonia = (await docRef.get()).data();
+    const mapa = colonia.mapa;
+    const fila = mapa[perdedor.y];
+    mapa[perdedor.y] = fila.substring(0, perdedor.x) + SYMB.muerto + fila.substring(perdedor.x + 1);
+    await docRef.update({ mapa });
+  }
+
+  // Peleas entre hembras (si exceden)
+  while (hembras.length > limiteHembras) {
+    const perdedor = hembras.pop();
+    await docRef.collection('criaturas').doc(perdedor.id).update({ estado: 'muerta' });
+    // igual que arriba
+  }
+
+  // Reproducción: si hay al menos un macho y una hembra, y no hay hembras embarazadas, posibilidad de aparearse
+  if (machos.length > 0 && hembras.length > 0) {
+    const hembraDisponible = hembras.find(h => !h.embarazada);
+    if (hembraDisponible && Math.random() < 0.05) { // 5% por tick
+      // Aparearse: la hembra queda embarazada
+      await docRef.collection('criaturas').doc(hembraDisponible.id).update({
+        embarazada: true,
+        tiempoRestanteEmbarazo: 100 // 100 ticks = ~3.3 minutos reales
+      });
+    }
+  }
+
+  // Nacimientos: hembras embarazadas reducen tiempo
+  const embarazadas = criaturasVivas.filter(c => c.embarazada);
+  for (const hembra of embarazadas) {
+    let nuevoTiempo = hembra.tiempoRestanteEmbarazo - 1;
+    if (nuevoTiempo <= 0) {
+      // Nace una nueva criatura
+      const nuevoNombre = `Criatura ${Math.floor(Math.random()*1000)}`;
+      const sexo = Math.random() < 0.5 ? 'macho' : 'hembra';
+      // Buscar lugar libre adyacente a la madre
+      const x = hembra.x, y = hembra.y;
+      const dirs = [[0,1],[0,-1],[1,0],[-1,0]];
+      let nx = x, ny = y;
+      for (const [dx, dy] of dirs) {
+        if (esTransitable(colonia.mapa, x+dx, y+dy)) { nx = x+dx; ny = y+dy; break; }
+      }
+      await docRef.collection('criaturas').add({
+        nombre: nuevoNombre, sexo, edad: 0, edadMaxima: 20,
+        embarazada: false, tiempoRestanteEmbarazo: 0,
+        estadisticas: { hambre: 50, sed: 50, aburrimiento: 0, sueño: 0, salud: 100, enfermedad: false },
+        estado: 'viva', x: nx, y: ny, tareaAsignada: null
+      });
+      // Actualizar madre
+      await docRef.collection('criaturas').doc(hembra.id).update({ embarazada: false, tiempoRestanteEmbarazo: 0 });
+    } else {
+      await docRef.collection('criaturas').doc(hembra.id).update({ tiempoRestanteEmbarazo: nuevoTiempo });
+    }
   }
 }
 
-tick();
-setInterval(tick, TICK_INTERVAL);
-console.log('🧠 Servidor con A* corriendo cada', TICK_INTERVAL/1000, 's');
+// ==================== Ciclo principal ====================
+async function tick() {
+  const coloniasSnap = await db.collection('mascotas').get();
+  coloniasSnap.forEach(async doc => {
+    const colonia = doc.data();
+    if (colonia.finDelJuego) return;
 
-// Servidor HTTP mínimo para Render
+    let mapa = colonia.mapa;
+    let recursos = colonia.recursos || { comida: 0, agua: 0 };
+    let hora = colonia.horaDelDia || 12;
+    let dias = colonia.diasTranscurridos || 0;
+
+    // Actualizar hora
+    tickCount++;
+    if (tickCount % TICKS_POR_HORA === 0) {
+      hora = (hora + 1) % 24;
+      if (hora === 0) {
+        dias++;
+        // Aumentar edad de todas las criaturas vivas
+        const criaturasSnap = await doc.collection('criaturas').where('estado', '==', 'viva').get();
+        criaturasSnap.forEach(c => c.ref.update({ edad: admin.firestore.FieldValue.increment(1) }));
+      }
+    }
+
+    // Obtener criaturas vivas
+    const criaturasSnap = await doc.collection('criaturas').where('estado', '==', 'viva').get();
+    const criaturas = [];
+    criaturasSnap.forEach(c => criaturas.push({ id: c.id, ...c.data() }));
+
+    // Procesar cada criatura
+    for (const criatura of criaturas) {
+      const nuevosRecursos = await procesarCriatura(doc, criatura.id, colonia, mapa, recursos, hora);
+      if (nuevosRecursos) recursos = nuevosRecursos;
+    }
+
+    // Reglas de población
+    await aplicarReglasPoblacion(doc, criaturas);
+
+    // Reaparición de arbustos (cada día de juego, probabilidad)
+    if (hora === 6 && Math.random() < 0.7) {
+      // Colocar un arbusto en un suelo vacío aleatorio
+      const suelos = [];
+      for (let y = 0; y < mapa.length; y++) {
+        for (let x = 0; x < mapa[y].length; x++) {
+          if (mapa[y][x] === SYMB.suelo) suelos.push({ x, y });
+        }
+      }
+      if (suelos.length > 0) {
+        const { x, y } = suelos[Math.floor(Math.random() * suelos.length)];
+        const fila = mapa[y];
+        mapa[y] = fila.substring(0, x) + SYMB.arbusto + fila.substring(x + 1);
+      }
+    }
+
+    // Verificar fin del juego
+    const vivas = (await doc.collection('criaturas').where('estado', '==', 'viva').get()).size;
+    if (vivas === 0 && criaturasSnap.size > 0) {
+      await doc.update({ finDelJuego: true, puntuacion: dias });
+    }
+
+    // Guardar colonia
+    await doc.update({
+      mapa, recursos, horaDelDia: hora, diasTranscurridos: dias
+    });
+  });
+  console.log(`✅ Tick procesado`);
+}
+
+setInterval(tick, TICK_INTERVAL);
+console.log('🧠 Servidor de colonia iniciado');
+
+// Servidor HTTP para Render
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Mascota virtual viva 🐜');
-}).listen(PORT, () => {
-  console.log(`🌐 Health check escuchando en puerto ${PORT}`);
-});
+  res.end('Colonia viva 🐜');
+}).listen(PORT, () => console.log(`🌐 Health check puerto ${PORT}`));
