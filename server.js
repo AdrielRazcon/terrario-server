@@ -1,19 +1,20 @@
 const admin = require('firebase-admin');
 const http = require('http');
 
-// Configuración de Firebase
+// ─── Configuración de Firebase ───
 let serviceAccount;
 if (process.env.SERVICE_ACCOUNT_JSON) {
   serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 } else {
   try { serviceAccount = require('./serviceAccountKey.json'); }
-  catch (e) { console.error('❌ Falta clave'); process.exit(1); }
+  catch (e) { console.error('❌ No se encontró clave de servicio'); process.exit(1); }
 }
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-const TICK_INTERVAL = 2000;
-const TICKS_POR_HORA = 30;
+// ─── Parámetros ───
+const TICK_INTERVAL = 2000;         // 2 segundos reales por tick
+const TICKS_POR_HORA = 30;          // 30 ticks = 1 hora de juego → 720 ticks = 1 día
 let tickCount = 0;
 
 const SYMB = {
@@ -25,11 +26,10 @@ const DECAY = {
   hambre: 0.08, sed: 0.08, aburrimiento: 0.05, sueño: 0.06
 };
 const UMBRAL = {
-  hambreCritica: 70, sedCritica: 70, aburrimientoCritico: 60, sueñoCritico: 70,
-  saludBaja: 30
+  hambreCritica: 70, sedCritica: 70, aburrimientoCritico: 60, sueñoCritico: 70
 };
 
-// Pathfinding A* (sin cambios)
+// ─── Pathfinding A* ───
 function aStar(mapa, startX, startY, targetX, targetY) {
   const rows = mapa.length, cols = mapa[0].length;
   const open = [], closed = new Set();
@@ -105,8 +105,8 @@ function calcularEmocion(est) {
   return 'enojado';
 }
 
-// ==================== Procesamiento de una criatura ====================
-async function procesarCriatura(docRef, criaturaId, colonia, mapa, recursos, hora) {
+// ─── Procesar una criatura ───
+async function procesarCriatura(docRef, criaturaId, mapa, recursos, hora) {
   const criaturaDoc = await docRef.collection('criaturas').doc(criaturaId).get();
   if (!criaturaDoc.exists) return;
   const data = criaturaDoc.data();
@@ -125,12 +125,12 @@ async function procesarCriatura(docRef, criaturaId, colonia, mapa, recursos, hor
   if (!est.enfermedad && Math.random() < 0.001) est.enfermedad = true;
   if (est.enfermedad) est.salud = Math.max(0, est.salud - 0.3);
 
-  // Muerte por causas naturales
+  // Muerte
   if (est.salud <= 0 || est.hambre >= 100 || est.sed >= 100 || data.edad >= data.edadMaxima) {
     const fila = mapa[y];
     mapa[y] = fila.substring(0, x) + SYMB.muerto + fila.substring(x + 1);
     await criaturaDoc.ref.update({ estado: 'muerta' });
-    return;
+    return { recursos, mapaActualizado: true };
   }
 
   // Decidir acción
@@ -165,7 +165,6 @@ async function procesarCriatura(docRef, criaturaId, colonia, mapa, recursos, hor
     accion = 'buscar_cama';
     objetivoChar = SYMB.cama;
   } else {
-    // Recolección si hay arbustos y espacio en almacén
     const hayArbusto = mapa.some(fila => fila.includes(SYMB.arbusto));
     if (hayArbusto && recursos.comida < 20) {
       accion = 'recolectar';
@@ -228,17 +227,17 @@ async function procesarCriatura(docRef, criaturaId, colonia, mapa, recursos, hor
     emocion: calcularEmocion(est)
   });
 
-  return { recursos };
+  return { recursos, mapaActualizado: true };
 }
 
-// ==================== Reglas de población y nacimientos ====================
+// ─── Reglas de población (peleas, reproducción) ───
 async function aplicarReglasPoblacion(docRef, criaturasVivas, mapa) {
   const machos = criaturasVivas.filter(c => c.sexo === 'macho' && c.edad >= 3);
   const hembras = criaturasVivas.filter(c => c.sexo === 'hembra' && c.edad >= 3);
   const limiteMachos = 1;
   const limiteHembras = 5;
 
-  // Peleas entre machos
+  // Peleas entre machos (elimina al último)
   while (machos.length > limiteMachos) {
     const perdedor = machos.pop();
     await docRef.collection('criaturas').doc(perdedor.id).update({ estado: 'muerta' });
@@ -265,12 +264,12 @@ async function aplicarReglasPoblacion(docRef, criaturasVivas, mapa) {
     }
   }
 
-  // Progreso de embarazos
+  // Progreso de embarazos y nacimientos
   const embarazadas = criaturasVivas.filter(c => c.embarazada);
   for (const hembra of embarazadas) {
     let nuevoTiempo = hembra.tiempoRestanteEmbarazo - 1;
     if (nuevoTiempo <= 0) {
-      // Nacer cría
+      // Nace cría
       const sexo = Math.random() < 0.5 ? 'macho' : 'hembra';
       const { x, y } = hembra;
       let nx = x, ny = y;
@@ -278,7 +277,7 @@ async function aplicarReglasPoblacion(docRef, criaturasVivas, mapa) {
       for (const [dx, dy] of dirs) {
         if (esTransitable(mapa, x+dx, y+dy)) { nx = x+dx; ny = y+dy; break; }
       }
-      const nuevoRef = await docRef.collection('criaturas').add({
+      await docRef.collection('criaturas').add({
         nombre: `Cria ${Math.floor(Math.random()*1000)}`,
         sexo,
         edad: 0,
@@ -301,125 +300,159 @@ async function aplicarReglasPoblacion(docRef, criaturasVivas, mapa) {
   }
 }
 
-// ==================== Tick principal ====================
-async function tick() {
-  const coloniasSnap = await db.collection('mascotas').get();
-  coloniasSnap.forEach(async doc => {
-    const colonia = doc.data();
-    if (colonia.finDelJuego) return;
+// ─── Inicializar colonia (crear Adam, Eva, arbusto y almacén si no existen) ───
+async function inicializarColonia(docRef) {
+  const coloniaSnap = await docRef.get();
+  const data = coloniaSnap.data();
+  if (data.inicializado) return;
 
-    // Inicializar campos si faltan
-    let mapa = colonia.mapa;
-    let recursos = colonia.recursos || { comida: 0, agua: 0 };
-    let hora = colonia.horaDelDia ?? 12;
-    let dias = colonia.diasTranscurridos ?? 0;
+  const mapa = data.mapa;
+  const criaturasSnap = await docRef.collection('criaturas').get();
+  if (!criaturasSnap.empty) {
+    // Ya tiene criaturas, marcar como inicializado y salir
+    await docRef.update({ inicializado: true });
+    return;
+  }
 
-    // --- INICIALIZACIÓN DE CRIATURAS INICIALES ---
-    const criaturasSnap = await doc.collection('criaturas').get();
-    if (criaturasSnap.empty) {
-      // Buscar posiciones libres en el mapa
-      let pos1 = null, pos2 = null;
-      for (let y = 1; y < mapa.length-1; y++) {
-        for (let x = 1; x < mapa[0].length-1; x++) {
-          if (mapa[y][x] === SYMB.suelo) {
-            if (!pos1) pos1 = { x, y };
-            else if (!pos2) { pos2 = { x, y }; break; }
-          }
-        }
-        if (pos2) break;
-      }
-      if (!pos1) pos1 = { x: 1, y: 1 };
-      if (!pos2) pos2 = { x: 2, y: 1 };
+  console.log(`🌱 Inicializando colonia ${docRef.id}...`);
 
-      await doc.collection('criaturas').add({
-        nombre: 'Adam',
-        sexo: 'macho',
-        edad: 5,
-        edadMaxima: 20,
-        embarazada: false,
-        tiempoRestanteEmbarazo: 0,
-        estadisticas: { hambre: 50, sed: 50, aburrimiento: 0, sueño: 0, salud: 100, enfermedad: false },
-        estado: 'viva',
-        x: pos1.x,
-        y: pos1.y,
-        tareaAsignada: null
-      });
-      await doc.collection('criaturas').add({
-        nombre: 'Eva',
-        sexo: 'hembra',
-        edad: 5,
-        edadMaxima: 20,
-        embarazada: false,
-        tiempoRestanteEmbarazo: 0,
-        estadisticas: { hambre: 50, sed: 50, aburrimiento: 0, sueño: 0, salud: 100, enfermedad: false },
-        estado: 'viva',
-        x: pos2.x,
-        y: pos2.y,
-        tareaAsignada: null
-      });
-
-      // También añadir un arbusto inicial y un almacén si no existen (opcional)
-      // ...
-    }
-
-    // Actualizar hora y días
-    tickCount++;
-    if (tickCount % TICKS_POR_HORA === 0) {
-      hora = (hora + 1) % 24;
-      if (hora === 0) {
-        dias++;
-        // Aumentar edad de criaturas vivas
-        const vivasSnap = await doc.collection('criaturas').where('estado', '==', 'viva').get();
-        vivasSnap.forEach(c => c.ref.update({ edad: admin.firestore.FieldValue.increment(1) }));
+  // Buscar posiciones libres para Adam y Eva
+  let pos1 = null, pos2 = null;
+  for (let y = 1; y < mapa.length-1; y++) {
+    for (let x = 1; x < mapa[0].length-1; x++) {
+      if (mapa[y][x] === SYMB.suelo) {
+        if (!pos1) pos1 = { x, y };
+        else if (!pos2) { pos2 = { x, y }; break; }
       }
     }
+    if (pos2) break;
+  }
+  if (!pos1) pos1 = { x: 2, y: 2 };
+  if (!pos2) pos2 = { x: 3, y: 2 };
 
-    // Obtener criaturas vivas (ahora ya existen)
-    const vivasSnap = await doc.collection('criaturas').where('estado', '==', 'viva').get();
-    const criaturasVivas = [];
-    vivasSnap.forEach(c => criaturasVivas.push({ id: c.id, ...c.data() }));
-
-    // Procesar cada criatura
-    for (const criatura of criaturasVivas) {
-      const result = await procesarCriatura(doc, criatura.id, colonia, mapa, recursos, hora);
-      if (result && result.recursos) recursos = result.recursos;
-    }
-
-    // Reglas de población (ahora con criaturas actualizadas)
-    await aplicarReglasPoblacion(doc, criaturasVivas, mapa);
-
-    // Reaparición de arbustos
-    if (hora === 6 && Math.random() < 0.7) {
-      const suelos = [];
-      for (let y = 0; y < mapa.length; y++) {
-        for (let x = 0; x < mapa[y].length; x++) {
-          if (mapa[y][x] === SYMB.suelo) suelos.push({ x, y });
-        }
-      }
-      if (suelos.length > 0) {
-        const { x, y } = suelos[Math.floor(Math.random() * suelos.length)];
-        mapa[y] = mapa[y].substring(0, x) + SYMB.arbusto + mapa[y].substring(x + 1);
-      }
-    }
-
-    // Verificar fin del juego
-    const vivasDespues = (await doc.collection('criaturas').where('estado', '==', 'viva').get()).size;
-    if (vivasDespues === 0 && criaturasSnap.size > 0) {
-      await doc.update({ finDelJuego: true, puntuacion: dias });
-    }
-
-    // Guardar colonia
-    await doc.update({
-      mapa, recursos, horaDelDia: hora, diasTranscurridos: dias
-    });
+  const criaturasRef = docRef.collection('criaturas');
+  await criaturasRef.add({
+    nombre: 'Adam', sexo: 'macho', edad: 5, edadMaxima: 20,
+    embarazada: false, tiempoRestanteEmbarazo: 0,
+    estadisticas: { hambre:50, sed:50, aburrimiento:0, sueño:0, salud:100, enfermedad:false },
+    estado: 'viva', x: pos1.x, y: pos1.y, tareaAsignada: null
   });
-  console.log(`✅ Tick procesado`);
+  await criaturasRef.add({
+    nombre: 'Eva', sexo: 'hembra', edad: 5, edadMaxima: 20,
+    embarazada: false, tiempoRestanteEmbarazo: 0,
+    estadisticas: { hambre:50, sed:50, aburrimiento:0, sueño:0, salud:100, enfermedad:false },
+    estado: 'viva', x: pos2.x, y: pos2.y, tareaAsignada: null
+  });
+
+  // Colocar un arbusto y un almacén si hay espacio
+  let mapaMod = [...mapa];
+  let colocados = 0;
+  for (let y = 1; y < mapaMod.length-1; y++) {
+    for (let x = 1; x < mapaMod[0].length-1; x++) {
+      if (mapaMod[y][x] === SYMB.suelo && colocados < 2) {
+        if (colocados === 0) {
+          mapaMod[y] = mapaMod[y].substring(0,x) + SYMB.arbusto + mapaMod[y].substring(x+1);
+          colocados++;
+        } else {
+          mapaMod[y] = mapaMod[y].substring(0,x) + SYMB.almacen + mapaMod[y].substring(x+1);
+          colocados++;
+          break;
+        }
+      }
+    }
+  }
+
+  await docRef.update({
+    inicializado: true,
+    mapa: mapaMod,
+    recursos: { comida: 0, agua: 0 }
+  });
+  console.log(`✅ Colonia ${docRef.id} inicializada con Adam, Eva, arbusto y almacén.`);
 }
 
-setInterval(tick, TICK_INTERVAL);
-console.log('🧠 Servidor de colonia iniciado');
+// ─── Tick principal ───
+async function tick() {
+  try {
+    const coloniasSnap = await db.collection('mascotas').get();
+    console.log(`⏰ Tick #${tickCount} - ${coloniasSnap.size} colonias`);
+    for (const doc of coloniasSnap.docs) {
+      const data = doc.data();
+      if (data.finDelJuego) continue;
 
-// Servidor HTTP para Render
+      // Inicializar si es necesario
+      await inicializarColonia(doc.ref);
+
+      // Recargar datos por si cambiaron durante la inicialización
+      const coloniaSnap = await doc.ref.get();
+      const colonia = coloniaSnap.data();
+      let mapa = colonia.mapa;
+      let recursos = colonia.recursos || { comida: 0, agua: 0 };
+      let hora = colonia.horaDelDia ?? 12;
+      let dias = colonia.diasTranscurridos ?? 0;
+
+      // Actualizar hora y días
+      tickCount++;
+      if (tickCount % TICKS_POR_HORA === 0) {
+        hora = (hora + 1) % 24;
+        if (hora === 0) {
+          dias++;
+          // Aumentar edad de todas las criaturas vivas
+          const vivasSnap = await doc.ref.collection('criaturas').where('estado', '==', 'viva').get();
+          for (const c of vivasSnap.docs) {
+            await c.ref.update({ edad: admin.firestore.FieldValue.increment(1) });
+          }
+        }
+      }
+
+      // Obtener criaturas vivas
+      const vivasSnap = await doc.ref.collection('criaturas').where('estado', '==', 'viva').get();
+      const criaturasVivas = [];
+      vivasSnap.forEach(c => criaturasVivas.push({ id: c.id, ...c.data() }));
+
+      // Procesar cada criatura
+      for (const criatura of criaturasVivas) {
+        const result = await procesarCriatura(doc.ref, criatura.id, mapa, recursos, hora);
+        if (result && result.recursos) recursos = result.recursos;
+      }
+
+      // Reglas de población (peleas, reproducción)
+      await aplicarReglasPoblacion(doc.ref, criaturasVivas, mapa);
+
+      // Reaparición de arbustos al amanecer (hora 6) con probabilidad
+      if (hora === 6 && Math.random() < 0.7) {
+        const suelos = [];
+        for (let y = 0; y < mapa.length; y++) {
+          for (let x = 0; x < mapa[y].length; x++) {
+            if (mapa[y][x] === SYMB.suelo) suelos.push({ x, y });
+          }
+        }
+        if (suelos.length > 0) {
+          const { x, y } = suelos[Math.floor(Math.random() * suelos.length)];
+          mapa[y] = mapa[y].substring(0, x) + SYMB.arbusto + mapa[y].substring(x + 1);
+        }
+      }
+
+      // Verificar fin del juego
+      const vivasDespues = await doc.ref.collection('criaturas').where('estado', '==', 'viva').get();
+      if (vivasDespues.empty && criaturasVivas.length > 0) {
+        await doc.ref.update({ finDelJuego: true, puntuacion: dias });
+      }
+
+      // Guardar cambios
+      await doc.ref.update({
+        mapa, recursos, horaDelDia: hora, diasTranscurridos: dias
+      });
+    }
+  } catch (error) {
+    console.error('🔥 Error en tick:', error);
+  }
+}
+
+// ─── Iniciar bucle ───
+setInterval(tick, TICK_INTERVAL);
+console.log('🧠 Servidor de colonia iniciado cada', TICK_INTERVAL/1000, 's');
+
+// ─── Health check para Render ───
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
