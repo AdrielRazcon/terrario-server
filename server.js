@@ -1,7 +1,7 @@
 const admin = require('firebase-admin');
 const http = require('http');
 
-// ─── Configuración de Firebase ───
+// Configuración de Firebase
 let serviceAccount;
 if (process.env.SERVICE_ACCOUNT_JSON) {
   serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
@@ -12,21 +12,20 @@ if (process.env.SERVICE_ACCOUNT_JSON) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// ─── Parámetros ───
-const TICK_INTERVAL = 2000;         // 2 segundos reales por tick
-const TICKS_POR_HORA = 30;          // 30 ticks = 1 hora de juego → 720 ticks = 1 día
-let tickCount = 0;
+const TICK_INTERVAL = 2000;            // 2 segundos reales
+const TICKS_POR_HORA = 30;            // 30 ticks = 1 hora de juego → 720 ticks = 1 día
+const HORA_AMANECER = 6;              // día de 6 a 24 (18 horas)
+const HORA_ANOCHECER = 24;
 
 const SYMB = {
   suelo: 'S', muro: 'M', comida: 'C', agua: 'A', cama: 'B', juguete: 'J',
-  arbusto: 'Y', almacen: 'L', pozo: 'W', muerto: 'D'
+  arbusto: 'Y', almacen: 'L', pozo: 'W', muerto: 'D', huevo: 'E'
 };
 
-const DECAY = {
-  hambre: 0.08, sed: 0.08, aburrimiento: 0.05, sueño: 0.06
-};
+const DECAY = { hambre: 0.08, sed: 0.08, aburrimiento: 0.05, sueño: 0.06 };
 const UMBRAL = {
-  hambreCritica: 70, sedCritica: 70, aburrimientoCritico: 60, sueñoCritico: 70
+  hambreCritica: 70, sedCritica: 70, aburrimientoCritico: 60, sueñoCritico: 70,
+  hambreExtrema: 100
 };
 
 // ─── Pathfinding A* ───
@@ -105,15 +104,18 @@ function calcularEmocion(est) {
   return 'enojado';
 }
 
-// ─── Procesar una criatura ───
-async function procesarCriatura(docRef, criaturaId, mapa, recursos, hora) {
+// ─── Procesar criatura ───
+async function procesarCriatura(docRef, criaturaId, mapa, recursos, hora, tickColonia) {
   const criaturaDoc = await docRef.collection('criaturas').doc(criaturaId).get();
-  if (!criaturaDoc.exists) return;
+  if (!criaturaDoc.exists) return { recursos };
   const data = criaturaDoc.data();
-  if (data.estado !== 'viva') return;
+  if (data.estado !== 'viva') return { recursos };
 
   let est = data.estadisticas;
   let x = data.x, y = data.y;
+  const inventario = data.inventario || { tipo: null, cantidad: 0 };
+  let accion = 'vagar';
+  let objetivoChar = null;
 
   // Decaimientos
   est.hambre = Math.min(100, est.hambre + DECAY.hambre);
@@ -125,38 +127,44 @@ async function procesarCriatura(docRef, criaturaId, mapa, recursos, hora) {
   if (!est.enfermedad && Math.random() < 0.001) est.enfermedad = true;
   if (est.enfermedad) est.salud = Math.max(0, est.salud - 0.3);
 
-  // Muerte
-  if (est.salud <= 0 || est.hambre >= 100 || est.sed >= 100 || data.edad >= data.edadMaxima) {
+  // Muerte por salud o vejez
+  if (est.salud <= 0 || data.edad >= data.edadMaxima) {
     const fila = mapa[y];
     mapa[y] = fila.substring(0, x) + SYMB.muerto + fila.substring(x + 1);
-    await criaturaDoc.ref.update({ estado: 'muerta' });
+    await criaturaDoc.ref.update({ estado: 'muerta', accionActual: 'muerto' });
     return { recursos, mapaActualizado: true };
   }
 
-  // Decidir acción
+  // Lógica de tareas según inventario y necesidades
   const esDeNoche = (hora >= 20 || hora < 6);
-  let accion = 'vagar';
-  let objetivoChar = null;
-
-  if (data.tareaAsignada) {
-    accion = 'tarea';
-    objetivoChar = SYMB[data.tareaAsignada.tipo] || null;
-    if (!objetivoChar) accion = 'vagar';
+  if (inventario.cantidad > 0) {
+    // Tiene recurso en manos, llevarlo al almacén (L)
+    accion = 'entregar_al_macen';
+    objetivoChar = SYMB.almacen;
   } else if (est.hambre > UMBRAL.hambreCritica) {
     if (recursos.comida > 0) {
       accion = 'ir_almacen_comer';
       objetivoChar = SYMB.almacen;
     } else {
-      accion = 'buscar_comida';
-      objetivoChar = SYMB.comida;
+      // Buscar fuente de comida: arbusto o cadáver
+      accion = 'recolectar_comida';
+      const arbusto = encontrarMasCercano(mapa, x, y, SYMB.arbusto);
+      const muerto = encontrarMasCercano(mapa, x, y, SYMB.muerto);
+      if (!arbusto && !muerto) {
+        // No hay comida, vagar (más tarde peleas)
+        accion = 'vagar';
+      } else {
+        const target = (!arbusto) ? muerto : (!muerto) ? arbusto : (Math.abs(arbusto.x-x)+Math.abs(arbusto.y-y) < Math.abs(muerto.x-x)+Math.abs(muerto.y-y) ? arbusto : muerto);
+        objetivoChar = mapa[target.y][target.x];
+      }
     }
   } else if (est.sed > UMBRAL.sedCritica) {
     if (recursos.agua > 0) {
       accion = 'ir_almacen_beber';
       objetivoChar = SYMB.almacen;
     } else {
-      accion = 'buscar_agua';
-      objetivoChar = SYMB.agua;
+      accion = 'recolectar_agua';
+      objetivoChar = SYMB.pozo;
     }
   } else if (est.aburrimiento > UMBRAL.aburrimientoCritico) {
     accion = 'buscar_juguete';
@@ -164,14 +172,18 @@ async function procesarCriatura(docRef, criaturaId, mapa, recursos, hora) {
   } else if (est.sueño > UMBRAL.sueñoCritico || (esDeNoche && est.sueño > 50)) {
     accion = 'buscar_cama';
     objetivoChar = SYMB.cama;
-  } else {
-    const hayArbusto = mapa.some(fila => fila.includes(SYMB.arbusto));
-    if (hayArbusto && recursos.comida < 20) {
-      accion = 'recolectar';
-      objetivoChar = SYMB.arbusto;
+  } else if (recursos.comida < 10) {
+    // Recolectar proactivamente si hay poco
+    const arbusto = encontrarMasCercano(mapa, x, y, SYMB.arbusto);
+    const muerto = encontrarMasCercano(mapa, x, y, SYMB.muerto);
+    if (arbusto || muerto) {
+      accion = 'recolectar_comida';
+      objetivoChar = (arbusto && (!muerto || Math.random() < 0.5)) ? SYMB.arbusto : SYMB.muerto;
     } else {
       accion = 'vagar';
     }
+  } else {
+    accion = 'vagar';
   }
 
   // Movimiento e interacción
@@ -182,32 +194,53 @@ async function procesarCriatura(docRef, criaturaId, mapa, recursos, hora) {
       x = paso.x; y = paso.y;
       if (x === coords.x && y === coords.y) {
         const tile = mapa[coords.y][coords.x];
-        if (accion === 'ir_almacen_comer') {
-          if (recursos.comida > 0) {
-            est.hambre = Math.max(0, est.hambre - 30);
-            recursos.comida--;
+        // Interacción según la acción
+        if (accion === 'entregar_al_macen') {
+          if (inventario.tipo === 'comida') {
+            recursos.comida++;
+            inventario.cantidad--;
+          } else if (inventario.tipo === 'agua') {
+            recursos.agua++;
+            inventario.cantidad--;
           }
-        } else if (accion === 'ir_almacen_beber') {
-          if (recursos.agua > 0) {
-            est.sed = Math.max(0, est.sed - 30);
-            recursos.agua--;
-          }
-        } else if (accion === 'buscar_comida' && tile === SYMB.comida) {
-          est.hambre = Math.max(0, est.hambre - 25);
-        } else if (accion === 'buscar_agua' && tile === SYMB.agua) {
-          est.sed = Math.max(0, est.sed - 25);
-        } else if (accion === 'buscar_juguete' && tile === SYMB.juguete) {
-          est.aburrimiento = Math.max(0, est.aburrimiento - 20);
-        } else if (accion === 'buscar_cama' && tile === SYMB.cama) {
-          est.sueño = Math.max(0, est.sueño - 35);
-        } else if (accion === 'recolectar' && tile === SYMB.arbusto) {
-          recursos.comida++;
-          if (Math.random() < 0.3) {
+          inventario.tipo = null;
+          accion = 'entregado';
+        } else if (accion === 'ir_almacen_comer' && recursos.comida > 0) {
+          est.hambre = Math.max(0, est.hambre - 30);
+          recursos.comida--;
+        } else if (accion === 'ir_almacen_beber' && recursos.agua > 0) {
+          est.sed = Math.max(0, est.sed - 30);
+          recursos.agua--;
+        } else if (accion === 'recolectar_comida') {
+          // Recoger del arbusto o cadáver
+          if (tile === SYMB.arbusto) {
+            inventario.tipo = 'comida';
+            inventario.cantidad = 1;
+            // El arbusto puede desaparecer
+            if (Math.random() < 0.3) {
+              const fila = mapa[coords.y];
+              mapa[coords.y] = fila.substring(0, coords.x) + SYMB.suelo + fila.substring(coords.x + 1);
+            }
+            accion = 'recolecto_comida';
+          } else if (tile === SYMB.muerto) {
+            inventario.tipo = 'comida';
+            inventario.cantidad = 1;
+            // El cadáver desaparece
             const fila = mapa[coords.y];
             mapa[coords.y] = fila.substring(0, coords.x) + SYMB.suelo + fila.substring(coords.x + 1);
+            accion = 'recolecto_cadaver';
           }
+        } else if (accion === 'recolectar_agua' && tile === SYMB.pozo) {
+          inventario.tipo = 'agua';
+          inventario.cantidad = 1;
+          accion = 'recolecto_agua';
+        } else if (accion === 'buscar_juguete' && tile === SYMB.juguete) {
+          est.aburrimiento = Math.max(0, est.aburrimiento - 20);
+          accion = 'jugo';
+        } else if (accion === 'buscar_cama' && tile === SYMB.cama) {
+          est.sueño = Math.max(0, est.sueño - 35);
+          accion = 'durmiendo';
         }
-        data.tareaAsignada = null;
       }
     }
   } else if (accion === 'vagar') {
@@ -220,103 +253,146 @@ async function procesarCriatura(docRef, criaturaId, mapa, recursos, hora) {
     }
   }
 
+  // Actualizar criatura
   await criaturaDoc.ref.update({
     estadisticas: est,
     x, y,
-    tareaAsignada: data.tareaAsignada,
+    inventario,
+    accionActual: accion,
     emocion: calcularEmocion(est)
   });
 
   return { recursos, mapaActualizado: true };
 }
 
-// ─── Reglas de población (peleas, reproducción) ───
-async function aplicarReglasPoblacion(docRef, criaturasVivas, mapa) {
+// ─── Hambre extrema: peleas ───
+async function manejarHambreExtrema(docRef, criaturasVivas, mapa) {
+  const hambrientos = criaturasVivas.filter(c => c.estadisticas.hambre >= UMBRAL.hambreExtrema);
+  if (hambrientos.length === 0) return;
+
+  // Ordenar prioridad: eliminar machos extra, luego hembras extra
   const machos = criaturasVivas.filter(c => c.sexo === 'macho' && c.edad >= 3);
   const hembras = criaturasVivas.filter(c => c.sexo === 'hembra' && c.edad >= 3);
-  const limiteMachos = 1;
-  const limiteHembras = 5;
+  let objetivo = null;
 
-  // Peleas entre machos (elimina al último)
-  while (machos.length > limiteMachos) {
-    const perdedor = machos.pop();
-    await docRef.collection('criaturas').doc(perdedor.id).update({ estado: 'muerta' });
-    const fila = mapa[perdedor.y];
-    mapa[perdedor.y] = fila.substring(0, perdedor.x) + SYMB.muerto + fila.substring(perdedor.x + 1);
+  if (machos.length > 1) {
+    // Matar al último macho (el más viejo o aleatorio)
+    objetivo = machos[machos.length - 1];
+  } else if (hembras.length > 1 && machos.length === 1) {
+    // Si hay un macho y varias hembras, eliminar una hembra extra (pero dejar al menos una)
+    objetivo = hembras[hembras.length - 1];
+  } else if (hembras.length > 1 && machos.length === 0) {
+    objetivo = hembras[hembras.length - 1]; // eliminar una hembra sobrante
+  } else if (machos.length === 1 && hembras.length === 1) {
+    // No se puede matar a nadie sin extinguir, mueren de hambre luego
+    return;
   }
 
-  // Peleas entre hembras
-  while (hembras.length > limiteHembras) {
-    const perdedor = hembras.pop();
-    await docRef.collection('criaturas').doc(perdedor.id).update({ estado: 'muerta' });
-    const fila = mapa[perdedor.y];
-    mapa[perdedor.y] = fila.substring(0, perdedor.x) + SYMB.muerto + fila.substring(perdedor.x + 1);
+  if (objetivo) {
+    // Matar a la criatura objetivo (convertir en muerto)
+    await docRef.collection('criaturas').doc(objetivo.id).update({
+      estado: 'muerta',
+      accionActual: 'muerto'
+    });
+    const fila = mapa[objetivo.y];
+    mapa[objetivo.y] = fila.substring(0, objetivo.x) + SYMB.muerto + fila.substring(objetivo.x + 1);
+    // Reducir hambre al atacante? No, pero ya obtendrán comida del cadáver más tarde.
   }
+}
 
-  // Reproducción
-  if (machos.length > 0 && hembras.length > 0) {
-    const hembraDisponible = hembras.find(h => !h.embarazada);
-    if (hembraDisponible && Math.random() < 0.05) {
-      await docRef.collection('criaturas').doc(hembraDisponible.id).update({
+// ─── Reproducción (huevos) ───
+async function gestionarReproduccion(docRef, criaturasVivas, mapa, tickColonia) {
+  const machos = criaturasVivas.filter(c => c.sexo === 'macho' && c.edad >= 3);
+  const hembras = criaturasVivas.filter(c => c.sexo === 'hembra' && c.edad >= 3);
+
+  // Apareamientos: hembra no embarazada, sin cooldown, macho disponible
+  for (const hembra of hembras) {
+    if (hembra.embarazada) continue;
+    if (hembra.ultimoParto && (tickColonia - hembra.ultimoParto) < 720) continue; // 1 día de cooldown
+    if (machos.length === 0) break;
+    if (Math.random() < 0.02) { // probabilidad baja por tick
+      await docRef.collection('criaturas').doc(hembra.id).update({
         embarazada: true,
-        tiempoRestanteEmbarazo: 100
+        tiempoEmbarazo: 0  // contador de ticks desde embarazo
       });
+      break; // solo un apareamiento por tick
     }
   }
 
-  // Progreso de embarazos y nacimientos
+  // Progreso de embarazo y puesta de huevos
   const embarazadas = criaturasVivas.filter(c => c.embarazada);
   for (const hembra of embarazadas) {
-    let nuevoTiempo = hembra.tiempoRestanteEmbarazo - 1;
-    if (nuevoTiempo <= 0) {
-      // Nace cría
-      const sexo = Math.random() < 0.5 ? 'macho' : 'hembra';
+    let tiempo = (hembra.tiempoEmbarazo || 0) + 1;
+    if (tiempo >= 50) { // 50 ticks → poner huevo
+      // Buscar celda adyacente libre
       const { x, y } = hembra;
-      let nx = x, ny = y;
       const dirs = [[0,1],[0,-1],[1,0],[-1,0]];
+      let colocado = false;
       for (const [dx, dy] of dirs) {
-        if (esTransitable(mapa, x+dx, y+dy)) { nx = x+dx; ny = y+dy; break; }
+        const nx = x + dx, ny = y + dy;
+        if (esTransitable(mapa, nx, ny) && mapa[ny][nx] === SYMB.suelo) {
+          const fila = mapa[ny];
+          mapa[ny] = fila.substring(0, nx) + SYMB.huevo + fila.substring(nx + 1);
+          colocado = true;
+          break;
+        }
       }
-      await docRef.collection('criaturas').add({
-        nombre: `Cria ${Math.floor(Math.random()*1000)}`,
-        sexo,
-        edad: 0,
-        edadMaxima: 20,
-        embarazada: false,
-        tiempoRestanteEmbarazo: 0,
-        estadisticas: { hambre: 50, sed: 50, aburrimiento: 0, sueño: 0, salud: 100, enfermedad: false },
-        estado: 'viva',
-        x: nx,
-        y: ny,
-        tareaAsignada: null
-      });
+      // Guardar huevo (no es criatura, es tile)
+      // La eclosión se maneja más abajo
       await docRef.collection('criaturas').doc(hembra.id).update({
         embarazada: false,
-        tiempoRestanteEmbarazo: 0
+        tiempoEmbarazo: 0,
+        ultimoParto: tickColonia
       });
+      // Eliminar el huevo del mapa? No, se queda como tile.
     } else {
-      await docRef.collection('criaturas').doc(hembra.id).update({ tiempoRestanteEmbarazo: nuevoTiempo });
+      await docRef.collection('criaturas').doc(hembra.id).update({ tiempoEmbarazo: tiempo });
+    }
+  }
+
+  // Eclosión de huevos: buscar tiles 'E', si llevan 720 ticks desde puesta, eclosionar.
+  // Al no tener registro del tick de puesta por huevo, simplificamos: cada tick, probabilidad baja de eclosionar.
+  // Mejor: guardar en el documento de la colonia un mapa de huevos con tick de puesta.
+  // Para no complicar, haremos que los huevos eclosionen después de 1 día (720 ticks) usando un campo adicional.
+  // Implementación rápida: al poner huevo, agregamos un documento en subcolección 'huevos' con posición y tickPuesta.
+  // Pero para simplificar en esta versión, cada tick, por cada tile 'E', con probabilidad baja (1/720) de convertirse en cría.
+  for (let y = 0; y < mapa.length; y++) {
+    for (let x = 0; x < mapa[y].length; x++) {
+      if (mapa[y][x] === SYMB.huevo && Math.random() < 1/720) {
+        // Eclosionar: crear cría y poner suelo
+        const sexo = Math.random() < 0.5 ? 'macho' : 'hembra';
+        await docRef.collection('criaturas').add({
+          nombre: `Cria ${Math.floor(Math.random()*1000)}`,
+          sexo,
+          edad: 0,
+          edadMaxima: 20,
+          embarazada: false,
+          tiempoEmbarazo: 0,
+          inventario: { tipo: null, cantidad: 0 },
+          estadisticas: { hambre: 50, sed: 50, aburrimiento: 0, sueño: 0, salud: 100, enfermedad: false },
+          estado: 'viva',
+          x, y,
+          accionActual: 'idle',
+          emocion: 'neutro'
+        });
+        mapa[y] = mapa[y].substring(0, x) + SYMB.suelo + mapa[y].substring(x + 1);
+      }
     }
   }
 }
 
-// ─── Inicializar colonia (crear Adam, Eva, arbusto y almacén si no existen) ───
+// ─── Inicializar colonia ───
 async function inicializarColonia(docRef) {
   const coloniaSnap = await docRef.get();
   const data = coloniaSnap.data();
   if (data.inicializado) return;
-
   const mapa = data.mapa;
   const criaturasSnap = await docRef.collection('criaturas').get();
   if (!criaturasSnap.empty) {
-    // Ya tiene criaturas, marcar como inicializado y salir
     await docRef.update({ inicializado: true });
     return;
   }
-
   console.log(`🌱 Inicializando colonia ${docRef.id}...`);
-
-  // Buscar posiciones libres para Adam y Eva
   let pos1 = null, pos2 = null;
   for (let y = 1; y < mapa.length-1; y++) {
     for (let x = 1; x < mapa[0].length-1; x++) {
@@ -330,21 +406,21 @@ async function inicializarColonia(docRef) {
   if (!pos1) pos1 = { x: 2, y: 2 };
   if (!pos2) pos2 = { x: 3, y: 2 };
 
-  const criaturasRef = docRef.collection('criaturas');
-  await criaturasRef.add({
+  await docRef.collection('criaturas').add({
     nombre: 'Adam', sexo: 'macho', edad: 5, edadMaxima: 20,
-    embarazada: false, tiempoRestanteEmbarazo: 0,
+    embarazada: false, tiempoEmbarazo: 0,
+    inventario: { tipo: null, cantidad: 0 },
     estadisticas: { hambre:50, sed:50, aburrimiento:0, sueño:0, salud:100, enfermedad:false },
-    estado: 'viva', x: pos1.x, y: pos1.y, tareaAsignada: null
+    estado: 'viva', x: pos1.x, y: pos1.y, accionActual: 'idle', emocion: 'neutro'
   });
-  await criaturasRef.add({
+  await docRef.collection('criaturas').add({
     nombre: 'Eva', sexo: 'hembra', edad: 5, edadMaxima: 20,
-    embarazada: false, tiempoRestanteEmbarazo: 0,
+    embarazada: false, tiempoEmbarazo: 0,
+    inventario: { tipo: null, cantidad: 0 },
     estadisticas: { hambre:50, sed:50, aburrimiento:0, sueño:0, salud:100, enfermedad:false },
-    estado: 'viva', x: pos2.x, y: pos2.y, tareaAsignada: null
+    estado: 'viva', x: pos2.x, y: pos2.y, accionActual: 'idle', emocion: 'neutro'
   });
 
-  // Colocar un arbusto y un almacén si hay espacio
   let mapaMod = [...mapa];
   let colocados = 0;
   for (let y = 1; y < mapaMod.length-1; y++) {
@@ -365,82 +441,82 @@ async function inicializarColonia(docRef) {
   await docRef.update({
     inicializado: true,
     mapa: mapaMod,
-    recursos: { comida: 0, agua: 0 }
+    recursos: { comida: 0, agua: 0 },
+    ticks: 0
   });
-  console.log(`✅ Colonia ${docRef.id} inicializada con Adam, Eva, arbusto y almacén.`);
+  console.log(`✅ Colonia inicializada`);
 }
 
 // ─── Tick principal ───
 async function tick() {
   try {
     const coloniasSnap = await db.collection('mascotas').get();
-    console.log(`⏰ Tick #${tickCount} - ${coloniasSnap.size} colonias`);
     for (const doc of coloniasSnap.docs) {
       const data = doc.data();
       if (data.finDelJuego) continue;
-
-      // Inicializar si es necesario
       await inicializarColonia(doc.ref);
 
-      // Recargar datos por si cambiaron durante la inicialización
-      const coloniaSnap = await doc.ref.get();
-      const colonia = coloniaSnap.data();
+      let colonia = (await doc.ref.get()).data();
       let mapa = colonia.mapa;
       let recursos = colonia.recursos || { comida: 0, agua: 0 };
-      let hora = colonia.horaDelDia ?? 12;
-      let dias = colonia.diasTranscurridos ?? 0;
+      let ticks = colonia.ticks || 0;
+      let dias = colonia.diasTranscurridos || 0;
 
-      // Actualizar hora y días
-      tickCount++;
-      if (tickCount % TICKS_POR_HORA === 0) {
-        hora = (hora + 1) % 24;
-        if (hora === 0) {
-          dias++;
-          // Aumentar edad de todas las criaturas vivas
-          const vivasSnap = await doc.ref.collection('criaturas').where('estado', '==', 'viva').get();
-          for (const c of vivasSnap.docs) {
-            await c.ref.update({ edad: admin.firestore.FieldValue.increment(1) });
-          }
-        }
-      }
+      // Incrementar tick
+      ticks++;
+      let hora = (Math.floor(ticks / TICKS_POR_HORA) % 24);
+      if (ticks % (TICKS_POR_HORA * 24) === 0) dias++;
 
-      // Obtener criaturas vivas
+      // Recolectar criaturas vivas
       const vivasSnap = await doc.ref.collection('criaturas').where('estado', '==', 'viva').get();
       const criaturasVivas = [];
       vivasSnap.forEach(c => criaturasVivas.push({ id: c.id, ...c.data() }));
 
       // Procesar cada criatura
       for (const criatura of criaturasVivas) {
-        const result = await procesarCriatura(doc.ref, criatura.id, mapa, recursos, hora);
+        const result = await procesarCriatura(doc.ref, criatura.id, mapa, recursos, hora, ticks);
         if (result && result.recursos) recursos = result.recursos;
       }
 
-      // Reglas de población (peleas, reproducción)
-      await aplicarReglasPoblacion(doc.ref, criaturasVivas, mapa);
+      // Hambre extrema
+      await manejarHambreExtrema(doc.ref, criaturasVivas, mapa);
 
-      // Reaparición de arbustos al amanecer (hora 6) con probabilidad
-      if (hora === 6 && Math.random() < 0.7) {
-        const suelos = [];
-        for (let y = 0; y < mapa.length; y++) {
-          for (let x = 0; x < mapa[y].length; x++) {
-            if (mapa[y][x] === SYMB.suelo) suelos.push({ x, y });
-          }
-        }
-        if (suelos.length > 0) {
-          const { x, y } = suelos[Math.floor(Math.random() * suelos.length)];
-          mapa[y] = mapa[y].substring(0, x) + SYMB.arbusto + mapa[y].substring(x + 1);
+      // Reproducción y huevos
+      await gestionarReproduccion(doc.ref, criaturasVivas, mapa, ticks);
+
+      // Aumentar edad al amanecer
+      if (hora === HORA_AMANECER && ticks % TICKS_POR_HORA === 0) {
+        const todasVivas = await doc.ref.collection('criaturas').where('estado', '==', 'viva').get();
+        for (const c of todasVivas.docs) {
+          await c.ref.update({ edad: admin.firestore.FieldValue.increment(1) });
         }
       }
 
-      // Verificar fin del juego
-      const vivasDespues = await doc.ref.collection('criaturas').where('estado', '==', 'viva').get();
-      if (vivasDespues.empty && criaturasVivas.length > 0) {
+      // Reaparición de arbustos (1-7 al amanecer)
+      if (hora === HORA_AMANECER && ticks % (TICKS_POR_HORA * 24) === 0) {
+        const cantidad = Math.floor(Math.random() * 7) + 1;
+        for (let i = 0; i < cantidad; i++) {
+          const suelos = [];
+          for (let y = 0; y < mapa.length; y++) {
+            for (let x = 0; x < mapa[y].length; x++) {
+              if (mapa[y][x] === SYMB.suelo) suelos.push({ x, y });
+            }
+          }
+          if (suelos.length > 0) {
+            const { x, y } = suelos[Math.floor(Math.random() * suelos.length)];
+            mapa[y] = mapa[y].substring(0, x) + SYMB.arbusto + mapa[y].substring(x + 1);
+          }
+        }
+      }
+
+      // Fin del juego si no hay vivas y había criaturas antes
+      if (vivasSnap.empty && criaturasVivas.length > 0) {
         await doc.ref.update({ finDelJuego: true, puntuacion: dias });
       }
 
-      // Guardar cambios
+      // Guardar
       await doc.ref.update({
-        mapa, recursos, horaDelDia: hora, diasTranscurridos: dias
+        mapa, recursos, ticks, diasTranscurridos: dias, horaDelDia: hora
       });
     }
   } catch (error) {
@@ -448,13 +524,11 @@ async function tick() {
   }
 }
 
-// ─── Iniciar bucle ───
 setInterval(tick, TICK_INTERVAL);
-console.log('🧠 Servidor de colonia iniciado cada', TICK_INTERVAL/1000, 's');
+console.log('🧠 Servidor iniciado');
 
-// ─── Health check para Render ───
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Colonia viva 🐜');
-}).listen(PORT, () => console.log(`🌐 Health check puerto ${PORT}`));
+  res.end('OK');
+}).listen(PORT, () => console.log(`🌐 Puerto ${PORT}`));
