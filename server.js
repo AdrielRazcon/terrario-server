@@ -392,7 +392,8 @@ async function inicializarColonia(docRef) {
     await docRef.update({ inicializado: true });
     return;
   }
-  console.log(`🌱 Inicializando colonia ${docRef.id}...`);
+
+  console.log(`🌱 Inicializando colonia ${docRef.id} (sin modificar mapa)...`);
   let pos1 = null, pos2 = null;
   for (let y = 1; y < mapa.length-1; y++) {
     for (let x = 1; x < mapa[0].length-1; x++) {
@@ -421,30 +422,8 @@ async function inicializarColonia(docRef) {
     estado: 'viva', x: pos2.x, y: pos2.y, accionActual: 'idle', emocion: 'neutro'
   });
 
-  let mapaMod = [...mapa];
-  let colocados = 0;
-  for (let y = 1; y < mapaMod.length-1; y++) {
-    for (let x = 1; x < mapaMod[0].length-1; x++) {
-      if (mapaMod[y][x] === SYMB.suelo && colocados < 2) {
-        if (colocados === 0) {
-          mapaMod[y] = mapaMod[y].substring(0,x) + SYMB.arbusto + mapaMod[y].substring(x+1);
-          colocados++;
-        } else {
-          mapaMod[y] = mapaMod[y].substring(0,x) + SYMB.almacen + mapaMod[y].substring(x+1);
-          colocados++;
-          break;
-        }
-      }
-    }
-  }
-
-  await docRef.update({
-    inicializado: true,
-    mapa: mapaMod,
-    recursos: { comida: 0, agua: 0 },
-    ticks: 0
-  });
-  console.log(`✅ Colonia inicializada`);
+  await docRef.update({ inicializado: true });
+  console.log(`✅ Colonia inicializada con Adam y Eva.`);
 }
 
 // ─── Tick principal ───
